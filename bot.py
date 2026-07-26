@@ -84,7 +84,8 @@ def fetch_latest_email_sync(email_address, app_password):
                 # 1. Subject Decode Karein
                 subject, encoding = decode_header(msg["Subject"])[0]
                 if isinstance(subject, bytes):
-                    subject = subject.decode(encoding if encoding else "utf-8")
+                    # errors='ignore' add kiya hai taaki koi ajeeb character hone par error na aaye
+                    subject = subject.decode(encoding if encoding else "utf-8", errors='ignore')
                 
                 response_text += f"📌 **Subject:** {subject}\n\n"
                 
@@ -93,20 +94,28 @@ def fetch_latest_email_sync(email_address, app_password):
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode()
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body = payload.decode(errors='ignore')
                             break
                 else:
-                    body = msg.get_payload(decode=True).decode()
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode(errors='ignore')
                 
-                # 3. OTP Extract Karein (Regex: 4-8 digit ka number dhundhega)
+                # 3. OTP / Highlighted Code Extract Karein (Optional)
                 otps = re.findall(r'\b\d{4,8}\b', body)
                 if otps:
-                    response_text += f"🔑 **Possible OTP(s):** `{', '.join(otps[:3])}`\n\n"
-                else:
-                    response_text += "⚠️ Koi direct OTP detect nahi hua. Niche detail dekhein:\n\n"
+                    response_text += f"🔑 **Possible Code(s):** `{', '.join(otps[:3])}`\n\n"
+                
+                # 4. Pura Message Dikhayein
+                # Telegram limit 4096 chars ki hoti hai, isliye hum max 3800 chars bhejenge
+                safe_body = body[:4096]
+                
+                if len(body) > 3800:
+                    safe_body += "\n\n⚠️ [Email lamba hone ki wajah se aage ka hissa cut gaya hai...]"
                     
-                # Message ka chota hissa dikhayein
-                response_text += f"📝 **Message:**\n{body[:250]}..."
+                response_text += f"📝 **Complete Message:**\n\n{safe_body}"
                 
         mail.logout()
         return response_text
@@ -115,7 +124,6 @@ def fetch_latest_email_sync(email_address, app_password):
         return "❌ Login Failed! App password ya Email galat hai."
     except Exception as e:
         return f"❌ Error: {e}"
-
 
 # ==========================================
 # 🤖 BOT COMMANDS
