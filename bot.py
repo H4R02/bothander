@@ -4,11 +4,13 @@ import imaplib
 import email
 from email.header import decode_header
 import re
+import html
 from aiohttp import web
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -18,6 +20,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 import telethon.errors
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 # ==========================================
 # ⚙️ 1. SYSTEM ENVIRONMENT & SETUP
@@ -25,20 +30,25 @@ import telethon.errors
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 API_ID = os.getenv("API_ID", "") 
 API_HASH = os.getenv("API_HASH", "")
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Fixed Deprecation Warning
+bot = Bot(
+    token=BOT_TOKEN, 
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
-# Database Initializing (Fixed back to OTP_Vault)
+# Database Initializing
 db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["OTP_Vault"]
 gmails_collection = db["gmails"]
 tg_collection = db["telegram_accounts"] 
 
 temp_clients = {}
+bg_tasks = [] # Added for graceful shutdown
 
 # ==========================================
 # 🛡️ 2. STATES & SECURITY
@@ -95,7 +105,7 @@ def get_back_home_keyboard():
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
     if not await is_owner(message): return
-    await state.clear() # Clear any stuck FSM process
+    await state.clear()
     
     welcome_text = (
         "🛡️ <b>TITAN OS [INTERACTIVE UI]</b>\n"
@@ -140,7 +150,7 @@ async def cb_status(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=get_back_home_keyboard())
 
 # ==========================================
-# 📧 5. GMAIL OPERATIONS (FSM & DYNAMIC UI)
+# 📧 5. GMAIL OPERATIONS
 # ==========================================
 @dp.callback_query(F.data == "g_list")
 async def cb_g_list(call: CallbackQuery):
@@ -195,7 +205,6 @@ async def g_process_password(message: types.Message, state: FSMContext):
         await message.answer(f"❌ <b>Error:</b> {e}", reply_markup=get_back_home_keyboard())
     await state.clear()
 
-# --- DYNAMIC OTP FETCH (GMAIL) ---
 @dp.callback_query(F.data == "g_fetch_menu")
 async def cb_g_fetch_menu(call: CallbackQuery):
     if not await is_owner(call): return
@@ -204,7 +213,6 @@ async def cb_g_fetch_menu(call: CallbackQuery):
         await call.message.edit_text("📭 No Gmails saved to fetch OTP.", reply_markup=get_gmail_keyboard())
         return
     
-    # Create Dynamic Buttons
     buttons = []
     for acc in accounts:
         buttons.append([InlineKeyboardButton(text=f"📧 {acc['alias']}", callback_data=f"getg_{acc['alias']}")])
@@ -223,14 +231,12 @@ async def cb_fetch_g_otp(call: CallbackQuery):
     
     await call.message.edit_text(f"⏳ <i>Scanning inbox for [<b>{alias}</b>]...</i>")
     
-    # Run IMAP script
     result = await asyncio.to_thread(fetch_latest_email_sync, account["email"], account["app_password"])
-    
     final_response = f"🛡️ <b>GMAIL INTERCEPT | [{alias.upper()}]</b>\n━━━━━━━━━━━━━━━━━━━━\n{result}"
     await call.message.edit_text(final_response, reply_markup=get_back_home_keyboard())
 
 # ==========================================
-# 📱 6. TELEGRAM OPERATIONS (FSM & DYNAMIC UI)
+# 📱 6. TELEGRAM OPERATIONS
 # ==========================================
 @dp.callback_query(F.data == "t_list")
 async def cb_t_list(call: CallbackQuery):
@@ -326,7 +332,6 @@ async def t_process_password(message: types.Message, state: FSMContext):
         await client.disconnect()
         await state.clear()
 
-# --- DYNAMIC OTP FETCH (TELEGRAM) ---
 @dp.callback_query(F.data == "t_fetch_menu")
 async def cb_t_fetch_menu(call: CallbackQuery):
     if not await is_owner(call): return
@@ -368,7 +373,9 @@ async def cb_fetch_t_otp(call: CallbackQuery):
         else:
             response = f"🛡️ <b>TELEGRAM INTERCEPT | {phone}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
             for msg in messages:
-                response += f"💬 <b>[OFFICIAL MESSAGE]:</b>\n<code>{msg.text}</code>\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
+                # Escaping HTML tags for safe Telegram rendering
+                safe_text = html.escape(msg.text or "")
+                response += f"💬 <b>[OFFICIAL MESSAGE]:</b>\n<code>{safe_text}</code>\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
             await wait_msg.edit_text(response, reply_markup=get_back_home_keyboard())
         await client.disconnect()
     except Exception as e:
@@ -378,6 +385,18 @@ async def cb_fetch_t_otp(call: CallbackQuery):
 # ==========================================
 # 🛠️ 7. CORE LOGIC (IMAP Fetch & Keep-Alive)
 # ==========================================
+def extract_text_from_html(html_content):
+    text = re.sub(r'<style.*?>.*?</style>', '', html_content, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<script.*?>.*?</script>', '', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</tr>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r' [ ]+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
+
 def fetch_latest_email_sync(email_address, app_password):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -388,25 +407,52 @@ def fetch_latest_email_sync(email_address, app_password):
         if not email_ids: return "📭 <i>Inbox is empty.</i>"
         latest_email_id = email_ids[-1]
         status, msg_data = mail.fetch(latest_email_id, "(RFC822)")
+        
         response_text = ""
         for response_part in msg_data:
             if isinstance(response_part, tuple):
                 msg = email.message_from_bytes(response_part[1])
                 subject, encoding = decode_header(msg["Subject"])[0]
-                if isinstance(subject, bytes): subject = subject.decode(encoding if encoding else "utf-8")
-                response_text += f"📌 <b>SUBJECT:</b> <code>{subject}</code>\n"
-                body = ""
+                if isinstance(subject, bytes): 
+                    subject = subject.decode(encoding if encoding else "utf-8", errors='ignore')
+                
+                safe_subject = html.escape(subject)
+                response_text += f"📌 <b>SUBJECT:</b> <code>{safe_subject}</code>\n"
+                
+                body_text = ""
+                html_text = ""
                 if msg.is_multipart():
                     for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode()
-                            break
-                else: body = msg.get_payload(decode=True).decode()
-                otps = re.findall(r'\b\d{4,8}\b', body)
+                        content_type = part.get_content_type()
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            decoded = payload.decode(errors='ignore')
+                            if content_type == "text/plain": body_text += decoded + "\n"
+                            elif content_type == "text/html": html_text += decoded + "\n"
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        if msg.get_content_type() == "text/html": html_text = payload.decode(errors='ignore')
+                        else: body_text = payload.decode(errors='ignore')
+                
+                final_body = body_text.strip()
+                if not final_body or len(final_body) < 150:
+                    if html_text:
+                        final_body = extract_text_from_html(html_text)
+                
+                otps = re.findall(r'\b\d{4,8}\b', final_body)
                 if otps: response_text += f"🔑 <b>DETECTED OTP:</b> <code>{', '.join(otps[:3])}</code>\n"
-                response_text += f"\n📝 <b>BODY:</b>\n<i>{body[:250]}...</i>"
+                
+                # IMPORTANT: Escape text for Telegram HTML Parser
+                safe_body = html.escape(final_body[:3800])
+                if len(final_body) > 3800:
+                    safe_body += "\n\n<i>[Message truncated due to size...]</i>"
+                
+                response_text += f"\n📝 <b>BODY:</b>\n<i>{safe_body}</i>"
         mail.logout()
         return response_text
+    except imaplib.IMAP4.error:
+        return "❌ <b>ERROR:</b> Login Failed! Invalid Email or App Password."
     except Exception as e:
         return f"❌ <b>ERROR:</b> {e}"
 
@@ -421,6 +467,8 @@ async def keep_sessions_alive():
                     await client.connect()
                     if await client.is_user_authorized(): await client.get_me()
                     await client.disconnect()
+        except asyncio.CancelledError:
+            break
         except Exception:
             pass
         await asyncio.sleep(43200)
@@ -437,10 +485,30 @@ async def web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
+# --- Graceful Shutdown Setup ---
+async def on_startup():
+    print("🚀 System Online: Starting Background Tasks")
+    bg_tasks.append(asyncio.create_task(web_server()))
+    bg_tasks.append(asyncio.create_task(keep_sessions_alive()))
+
+async def on_shutdown():
+    print("🛑 Shutting down: Cleaning up tasks")
+    for task in bg_tasks:
+        task.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+
 async def main():
-    asyncio.create_task(web_server())
-    asyncio.create_task(keep_sessions_alive())
-    await dp.start_polling(bot)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped.")
