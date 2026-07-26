@@ -4,6 +4,7 @@ import imaplib
 import email
 from email.header import decode_header
 import re
+import html
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from telethon.sync import TelegramClient
@@ -14,32 +15,39 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from motor.motor_asyncio import AsyncIOMotorClient
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 import logging
-logging.basicConfig(level=logging.INFO) # <-- Yeh line add karein
+
+logging.basicConfig(level=logging.INFO)
 
 # 1. Environment variables load karein
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-API_ID = os.getenv("API_ID", "") 
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+API_ID = os.getenv("API_ID", "")
 API_HASH = os.getenv("API_HASH", "")
 
-# 2. Bot, Dispatcher aur Database setup
-bot = Bot(token=BOT_TOKEN)
+# 2. Bot, Dispatcher aur Database setup (Warning Fixed)
+bot = Bot(
+    token=BOT_TOKEN, 
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+)
 dp = Dispatcher()
 
 # MongoDB se connect karein
 db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["OTP_Vault"]
 gmails_collection = db["gmails"]
-# Telegram accounts ke liye nayi collection
 tg_collection = db["telegram_accounts"]
 
-# Temp clients save karne ke liye dictionary (taaki login beech me kate na)
+# Temp clients save karne ke liye dictionary
 temp_clients = {}
+# Background tasks ko manage karne ke liye list
+bg_tasks = []
 
-# FSM States (Bot ko yaad dilane ke liye ki wo kya mang raha hai)
+# FSM States
 class TgLogin(StatesGroup):
     phone = State()
     code = State()
@@ -48,25 +56,41 @@ class TgLogin(StatesGroup):
 # ==========================================
 # 🔒 OWNER CHECK (Security Layer)
 # ==========================================
-# Yeh function check karega ki message aapne bheja hai ya kisi aur ne
 async def is_owner(message: types.Message) -> bool:
     if message.from_user.id != OWNER_ID:
-        # Agar koi aur user start karega, bot usko block/ignore kar dega
         print(f"Unauthorized access alert! User ID: {message.from_user.id}")
         return False
     return True
+
+# ==========================================
+# 📧 HTML TO TEXT CONVERTER (For Full Google Emails)
+# ==========================================
+def extract_text_from_html(html_content):
+    # CSS aur Javascript hatao
+    text = re.sub(r'<style.*?>.*?</style>', '', html_content, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<script.*?>.*?</script>', '', text, flags=re.IGNORECASE|re.DOTALL)
+    # Line breaks aur paragraphs ko real newlines me badlo
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</tr>', '\n', text, flags=re.IGNORECASE)
+    # Baaki sab HTML tags hata do
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # HTML Entities decode karo (&amp; -> &)
+    text = html.unescape(text)
+    # Faltu spaces clean karo
+    text = re.sub(r' [ ]+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
 
 # ==========================================
 # 📧 GMAIL IMAP FETCHER (Background Worker)
 # ==========================================
 def fetch_latest_email_sync(email_address, app_password):
     try:
-        # Gmail se connect karein
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(email_address, app_password)
         mail.select("inbox")
         
-        # Sabse latest mail (ALL me se aakhiri) search karein
         status, messages = mail.search(None, "ALL")
         email_ids = messages[0].split()
         
@@ -81,41 +105,52 @@ def fetch_latest_email_sync(email_address, app_password):
             if isinstance(response_part, tuple):
                 msg = email.message_from_bytes(response_part[1])
                 
-                # 1. Subject Decode Karein
+                # Subject Decode
                 subject, encoding = decode_header(msg["Subject"])[0]
                 if isinstance(subject, bytes):
-                    # errors='ignore' add kiya hai taaki koi ajeeb character hone par error na aaye
                     subject = subject.decode(encoding if encoding else "utf-8", errors='ignore')
                 
-                response_text += f"📌 **Subject:** {subject}\n\n"
+                response_text += f"📌 **SUBJECT:** {subject}\n\n"
                 
-                # 2. Body Extract Karein (Plain Text)
-                body = ""
+                # Body Extract (Text and HTML Both)
+                body_text = ""
+                html_text = ""
+                
                 if msg.is_multipart():
                     for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                body = payload.decode(errors='ignore')
-                            break
+                        content_type = part.get_content_type()
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            decoded = payload.decode(errors='ignore')
+                            if content_type == "text/plain":
+                                body_text += decoded + "\n"
+                            elif content_type == "text/html":
+                                html_text += decoded + "\n"
                 else:
                     payload = msg.get_payload(decode=True)
                     if payload:
-                        body = payload.decode(errors='ignore')
+                        if msg.get_content_type() == "text/html":
+                            html_text = payload.decode(errors='ignore')
+                        else:
+                            body_text = payload.decode(errors='ignore')
                 
-                # 3. OTP / Highlighted Code Extract Karein (Optional)
-                otps = re.findall(r'\b\d{4,8}\b', body)
+                # Agar text chota hai (Google cut kar deta hai), toh HTML se pura text nikaalo
+                final_body = body_text.strip()
+                if not final_body or len(final_body) < 150:
+                    if html_text:
+                        final_body = extract_text_from_html(html_text)
+                
+                # OTP Extraction
+                otps = re.findall(r'\b\d{4,8}\b', final_body)
                 if otps:
-                    response_text += f"🔑 **Possible Code(s):** `{', '.join(otps[:3])}`\n\n"
+                    response_text += f"🔑 **DETECTED OTP(s):** `{', '.join(otps[:3])}`\n\n"
                 
-                # 4. Pura Message Dikhayein
-                # Telegram limit 4096 chars ki hoti hai, isliye hum max 3800 chars bhejenge
-                safe_body = body[:4096]
-                
-                if len(body) > 3800:
-                    safe_body += "\n\n⚠️ [Email lamba hone ki wajah se aage ka hissa cut gaya hai...]"
+                # Safe Limit (Telegram max limit is 4096, keeping margin for headers)
+                safe_body = final_body[:3800]
+                if len(final_body) > 3800:
+                    safe_body += "\n\n⚠️ [Email itna lamba tha ki Telegram limit ki wajah se end me cut ho gaya.]"
                     
-                response_text += f"📝 **Complete Message:**\n\n{safe_body}"
+                response_text += f"📝 **BODY:**\n{safe_body}"
                 
         mail.logout()
         return response_text
@@ -128,7 +163,6 @@ def fetch_latest_email_sync(email_address, app_password):
 # ==========================================
 # 🤖 BOT COMMANDS
 # ==========================================
-
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     if not await is_owner(message): return
@@ -147,19 +181,14 @@ async def start_command(message: types.Message):
 async def add_mail_command(message: types.Message):
     if not await is_owner(message): return
     
-    # User message ko split karke data nikalna
-    # Example command format: /addmail gaming pro-gamer@gmail.com app_password
     args = message.text.split()
-    
     if len(args) != 4:
         await message.answer("⚠️ Sahi format use karein:\n`/addmail <alias> <email> <app_password>`")
         return
         
     alias, email_id, app_pass = args[1], args[2], args[3]
     
-    # MongoDB me data insert karna
     try:
-        # Check karna ki alias pehle se exist toh nahi karta
         existing = await gmails_collection.find_one({"alias": alias})
         if existing:
             await message.answer(f"❌ '{alias}' naam se pehle hi ek mail save hai. Dusra naam use karein.")
@@ -203,29 +232,22 @@ async def get_mail_command(message: types.Message):
         
     alias = args[1]
     
-    # 1. Database se account dhundhein
     account = await gmails_collection.find_one({"alias": alias})
-    
     if not account:
         await message.answer(f"❌ '{alias}' naam ka koi account nahi mila. Pehle `/listmails` check karein.")
         return
         
-    # 2. Loading message bhejein
     wait_msg = await message.answer("⏳ Inbox check kar raha hoon... kripya wait karein.")
     
-    # 3. Background thread me IMAP function chalayein
     email_address = account["email"]
     app_password = account["app_password"]
     
     result = await asyncio.to_thread(fetch_latest_email_sync, email_address, app_password)
-    
-    # 4. Result Edit karke dikhayein
-    await wait_msg.edit_text(f"📧 **Alias:** {alias}\n\n{result}")
+    await wait_msg.edit_text(f"🛡️ **GMAIL INTERCEPT | [{alias.upper()}]**\n━━━━━━━━━━━━━━━━━━━━\n{result}")
 
 # ==========================================
 # 📱 TELEGRAM ACCOUNT LOGIN COMMANDS (FSM)
 # ==========================================
-
 @dp.message(Command("addtg"))
 async def add_tg_start(message: types.Message, state: FSMContext):
     if not await is_owner(message): return
@@ -239,7 +261,6 @@ async def process_phone(message: types.Message, state: FSMContext):
     
     wait_msg = await message.answer("⏳ Telegram server se connect kar raha hoon aur OTP bhej raha hoon...")
     
-    # Telethon Client initialize karein
     client = TelegramClient(
         StringSession(), 
         API_ID, 
@@ -251,11 +272,9 @@ async def process_phone(message: types.Message, state: FSMContext):
     await client.connect()
     
     try:
-        # OTP bhejne ki request
         code_request = await client.send_code_request(phone)
         phone_code_hash = code_request.phone_code_hash
         
-        # Is connection ko temporary save karein
         temp_clients[message.from_user.id] = {
             "client": client,
             "phone_code_hash": phone_code_hash
@@ -286,10 +305,7 @@ async def process_code(message: types.Message, state: FSMContext):
     wait_msg = await message.answer("⏳ OTP verify kar raha hoon...")
     
     try:
-        # OTP ke sath Sign In karein
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-        
-        # Agar successful hua toh string banakar MongoDB me save karein
         session_string = client.session.save()
         await tg_collection.insert_one({"phone": phone, "session_string": session_string})
         
@@ -299,7 +315,6 @@ async def process_code(message: types.Message, state: FSMContext):
         await state.clear()
         
     except telethon.errors.SessionPasswordNeededError:
-        # Agar 2-Step Verification laga ho
         await wait_msg.edit_text("🔒 Is account par 2-Step Verification (Cloud Password) laga hai. Kripya apna password bhejein:")
         await state.set_state(TgLogin.password)
         
@@ -320,10 +335,7 @@ async def process_password(message: types.Message, state: FSMContext):
     wait_msg = await message.answer("⏳ Password verify kar raha hoon...")
     
     try:
-        # Password ke sath Sign In karein
         await client.sign_in(password=password)
-        
-        # Save to DB
         session_string = client.session.save()
         await tg_collection.insert_one({"phone": phone, "session_string": session_string})
         
@@ -338,7 +350,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await state.clear()
 
 # ==========================================
-# 🌐 DUMMY WEB SERVER (For Render Port Binding)
+# 🌐 DUMMY WEB SERVER & KEEP ALIVE
 # ==========================================
 async def handle_ping(request):
     return web.Response(text="Bot is Live and Running!")
@@ -348,15 +360,11 @@ async def web_server():
     app.router.add_get('/', handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render automatic $PORT environment variable deta hai
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Dummy web server started on port {port}")
 
-# ==========================================
-# 🔄 TELEGRAM SESSION KEEP-ALIVE (Auto-Ping)
-# ==========================================
 async def keep_sessions_alive():
     while True:
         try:
@@ -369,7 +377,6 @@ async def keep_sessions_alive():
                 phone = acc.get("phone")
                 
                 if session_str:
-                    # Custom Device Name yahan set kiya gaya hai
                     client = TelegramClient(
                         StringSession(session_str), 
                         API_ID, 
@@ -381,31 +388,49 @@ async def keep_sessions_alive():
                     await client.connect()
                     
                     if await client.is_user_authorized():
-                        await client.get_me() # Ping server
+                        await client.get_me()
                         print(f"✅ Session kept alive for: {phone}")
                     else:
                         print(f"⚠️ Session expired or invalid for: {phone}")
                         
                     await client.disconnect()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             print(f"❌ Keep Alive Error: {e}")
             
-        # Har 12 ghante (43200 seconds) baad dobara check karega
         await asyncio.sleep(43200)
 
 # ==========================================
-# 🚀 BOT RUNNER
+# 🚀 GRACEFUL STARTUP & SHUTDOWN (Error Fix)
 # ==========================================
+async def on_startup():
+    print("🚀 Starting background tasks...")
+    bg_tasks.append(asyncio.create_task(web_server()))
+    bg_tasks.append(asyncio.create_task(keep_sessions_alive()))
+
+async def on_shutdown():
+    print("🛑 Shutting down bot... cleaning up tasks.")
+    for task in bg_tasks:
+        task.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+    print("✅ All background tasks closed safely.")
+
 async def main():
     print("Bot is starting...")
-    # 1. Background me Dummy Web Server start karein Render ke liye
-    asyncio.create_task(web_server())
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     
-    # 2. Telegram Sessions ko zinda rakhne wala task start karein
-    asyncio.create_task(keep_sessions_alive())
-    
-    # 3. Telegram Bot start karein
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user.")
